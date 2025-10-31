@@ -1,124 +1,146 @@
-import streamlit as st
+# app.py
+import io
 import pandas as pd
-import plotly.express as px
-from datetime import datetime
-import os
-from pathlib import Path
- 
-# ページ設定
-st.set_page_config(page_title="エラー可視化ダッシュボード", page_icon=":bar_chart:")
- 
-# データ保存用CSVファイルとバックアップフォルダ
-DATA_FILE = "error_data.csv"
-BACKUP_FOLDER = Path("backups")
-BACKUP_FOLDER.mkdir(exist_ok=True)
- 
-# CSVファイルが存在すれば読み込み、なければ空のデータフレームを作成
-if os.path.exists(DATA_FILE):
-    df = pd.read_csv(DATA_FILE, parse_dates=["timestamp"])
+import numpy as np
+import altair as alt
+import streamlit as st
+
+st.set_page_config(page_title='監視エラー 可視化', layout='wide')
+st.title('監視エラー可視化アプリ')
+
+st.markdown("""
+**機能**
+1. Excel（Sheet1）を読み込み（アップロード or カレントの`監視エラー.xlsx`）
+2. 全体／host別／connector別の件数を **日次・週次・月次** でグラフ表示
+3. 直近期間と前期間の **増加率** を表示
+""")
+
+# --- Data loader ---
+@st.cache_data
+def load_data(file_bytes: bytes = None, fallback_path: str = '監視エラー.xlsx'):
+    if file_bytes is not None:
+        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name='Sheet1', engine='openpyxl')
+    else:
+        # カレントにファイルがある場合の自動読み込み
+        df = pd.read_excel(fallback_path, sheet_name='Sheet1', engine='openpyxl')
+
+    # cleaning
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    df = df.dropna(subset=['timestamp']).copy()
+    df['host'] = df['host'].astype(str).str.strip()
+    df['url'] = df['url'].astype(str).str.strip()
+    df['connector'] = df['connector'].astype(str).str.strip()
+
+    # タイムゾーン（任意）：naiveならAsia/Tokyoとして扱う
+    if df['timestamp'].dt.tz is None:
+        df['timestamp'] = df['timestamp'].dt.tz_localize('Asia/Tokyo', ambiguous='NaT', nonexistent='shift_forward')
+    return df
+
+uploaded = st.file_uploader('Excelファイル（監視エラー.xlsx）を選択', type=['xlsx'])
+
+try:
+    df = load_data(uploaded.getvalue() if uploaded else None)
+except Exception as e:
+    st.error(f'読み込みエラー: {e}')
+    st.stop()
+
+# --- Sidebar controls ---
+freq_label = st.sidebar.radio('集計粒度', ['日次','週次','月次'], index=0)
+freq_map = {'日次': 'D', '週次': 'W-MON', '月次': 'M'}
+freq = freq_map[freq_label]
+
+dim_label = st.sidebar.radio('集計軸', ['全体','host','connector'], index=0)
+
+# 期間フィルター
+min_date = df['timestamp'].min().date()
+max_date = df['timestamp'].max().date()
+start, end = st.sidebar.date_input('期間', (min_date, max_date), min_value=min_date, max_value=max_date)
+if isinstance(start, tuple) or isinstance(end, tuple):  # streamlitの仕様吸収
+    start, end = start[0], end[0]
+mask = (df['timestamp'].dt.date >= start) & (df['timestamp'].dt.date <= end)
+df = df.loc[mask].copy()
+
+# URLキーワード（任意）
+kw = st.sidebar.text_input('URLキーワード（任意フィルター）')
+if kw:
+    df = df[df['url'].str.contains(kw, case=False, na=False)]
+
+# --- Aggregation ---
+if dim_label == '全体':
+    grouped = df.groupby(pd.Grouper(key='timestamp', freq=freq)).size().rename('count').reset_index()
 else:
-    df = pd.DataFrame(columns=["timestamp", "error_destination", "connector_server", "connection_type"])
- 
-# 入力フォーム
-with st.form("error_input_form"):
-    st.subheader("エラー情報の入力")
-    input_date = st.date_input("日付", value=datetime.today())
-    error_destination = st.selectbox("エラーの宛先", ["ServerA", "ServerB", "ServerC"])
-    connector_server = st.selectbox("コネクタサーバ", ["Connector1", "Connector2", "Connector3"])
-    connection_type = st.selectbox("接続方式", ["有線", "無線"])
-    submitted = st.form_submit_button("追加")
- 
-# 入力があればCSVに追記し、バックアップも保存
-if submitted:
-    new_entry = pd.DataFrame([{
-        "timestamp": pd.to_datetime(input_date),
-        "error_destination": error_destination,
-        "connector_server": connector_server,
-        "connection_type": connection_type
-    }])
-    df = pd.concat([df, new_entry], ignore_index=True)
-    df.to_csv(DATA_FILE, index=False)
- 
-    # バックアップファイル名にタイムスタンプを付けて保存
-    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_file = BACKUP_FOLDER / f"error_data_backup_{timestamp_str}.csv"
-    df.to_csv(backup_file, index=False)
- 
-    st.success("エラー情報を追加し、バックアップを保存しました")
- 
-# データが存在する場合のみ可視化
-if not df.empty:
-    # 時系列列の追加（フォーマット調整）
-    df["date"] = df["timestamp"].dt.strftime("%Y/%m/%d")
-    df["month"] = df["timestamp"].dt.strftime("%Y/%m")
-    df["year"] = df["timestamp"].dt.year
- 
-    # サイドバーでフィルターと削除機能
-    st.sidebar.header("フィルター")
-    selected_destination = st.sidebar.multiselect("エラーの宛先", df["error_destination"].unique(), default=df["error_destination"].unique())
-    selected_connector = st.sidebar.multiselect("コネクタサーバ", df["connector_server"].unique(), default=df["connector_server"].unique())
-    selected_connection = st.sidebar.multiselect("接続方式", df["connection_type"].unique(), default=df["connection_type"].unique())
- 
-    # 削除機能
-    st.sidebar.header("入力データの削除")
-    if st.sidebar.button("最新の入力を削除"):
-        df = df.iloc[:-1]
-        df.to_csv(DATA_FILE, index=False)
-        st.sidebar.success("最新の入力を削除しました")
- 
-    filtered_df = df[
-        df["error_destination"].isin(selected_destination) &
-        df["connector_server"].isin(selected_connector) &
-        df["connection_type"].isin(selected_connection)
-    ]
- 
-    # タブで表示切り替え
-    tab1, tab2, tab3, tab4 = st.tabs(["全体", "宛先別", "コネクタサーバ別", "接続方式別"])
- 
-    def plot_error_counts(group_df, group_col, title_prefix):
-        if group_df.empty:
-            st.warning(f"{title_prefix} に該当するデータがありません。")
-            return
- 
-        if group_col:
-            daily = group_df.groupby([group_col, "date"]).size().reset_index(name="count")
-            if not daily.empty:
-                fig_daily = px.bar(daily, x="date", y="count", color=group_col, title=f"{title_prefix} - 日次")
-                st.plotly_chart(fig_daily)
- 
-            monthly = group_df.groupby([group_col, "month"]).size().reset_index(name="count")
-            if not monthly.empty:
-                fig_monthly = px.bar(monthly, x="month", y="count", color=group_col, title=f"{title_prefix} - 月次")
-                st.plotly_chart(fig_monthly)
- 
-            yearly = group_df.groupby([group_col, "year"]).size().reset_index(name="count")
-            if not yearly.empty:
-                fig_yearly = px.bar(yearly, x="year", y="count", color=group_col, title=f"{title_prefix} - 年次")
-                st.plotly_chart(fig_yearly)
-        else:
-            daily = group_df.groupby("date").size().reset_index(name="count")
-            if not daily.empty:
-                fig_daily = px.bar(daily, x="date", y="count", title=f"{title_prefix} - 日次")
-                st.plotly_chart(fig_daily)
- 
-            monthly = group_df.groupby("month").size().reset_index(name="count")
-            if not monthly.empty:
-                fig_monthly = px.bar(monthly, x="month", y="count", title=f"{title_prefix} - 月次")
-                st.plotly_chart(fig_monthly)
- 
-            yearly = group_df.groupby("year").size().reset_index(name="count")
-            if not yearly.empty:
-                fig_yearly = px.bar(yearly, x="year", y="count", title=f"{title_prefix} - 年次")
-                st.plotly_chart(fig_yearly)
- 
-    with tab1:
-        plot_error_counts(filtered_df, group_col=None, title_prefix="全体")
- 
-    with tab2:
-        plot_error_counts(filtered_df, group_col="error_destination", title_prefix="宛先別")
- 
-    with tab3:
-        plot_error_counts(filtered_df, group_col="connector_server", title_prefix="コネクタサーバ別")
- 
-    with tab4:
-        plot_error_counts(filtered_df, group_col="connection_type", title_prefix="接続方式別")
+    grouped = df.groupby([dim_label, pd.Grouper(key='timestamp', freq=freq)]).size().rename('count').reset_index()
+
+# --- Chart ---
+if dim_label == '全体':
+    chart = alt.Chart(grouped).mark_line(point=True).encode(
+        x=alt.X('timestamp:T', title=f'{freq_label}'),
+        y=alt.Y('count:Q', title='件数'),
+        tooltip=['timestamp:T','count:Q']
+    )
+else:
+    # Top N選択
+    topn = st.sidebar.slider('表示する上位グループ数', 3, 20, 10)
+    latest_totals = grouped.groupby(dim_label)['count'].sum().sort_values(ascending=False).head(topn).index.tolist()
+    grouped = grouped[grouped[dim_label].isin(latest_totals)]
+    chart = alt.Chart(grouped).mark_line(point=True).encode(
+        x=alt.X('timestamp:T', title=f'{freq_label}'),
+        y=alt.Y('count:Q', title='件数'),
+        color=alt.Color(f'{dim_label}:N', title=dim_label),
+        tooltip=['timestamp:T', 'count:Q', alt.Tooltip(f'{dim_label}:N', title=dim_label)]
+    )
+
+st.altair_chart(chart.properties(width=1100, height=380), use_container_width=True)
+
+# --- Growth (増加率) ---
+st.subheader('増加率（当期 vs 前期）')
+
+def show_metrics(g, label_name=None):
+    g = g.sort_values('timestamp').copy()
+    g['pct_change'] = g['count'].pct_change()
+    if len(g) >= 2:
+        last = g.iloc[-1]
+        prev = g.iloc[-2]
+        delta = (last['count'] - prev['count'])
+        pct = g['pct_change'].iloc[-1]
+        label = f"{prev['timestamp'].date()} → {last['timestamp'].date()}"
+        if label_name:
+            label = f"{label_name}｜{label}"
+        st.metric(
+            label=label,
+            value=f"{int(last['count'])} 件",
+            delta=f"{int(delta):+d} 件 / {pct*100:.1f} %" if pd.notna(pct) else "—"
+        )
+    else:
+        st.info('増加率を計算するには2期間以上が必要です')
+
+if dim_label == '全体':
+    show_metrics(grouped)
+else:
+    cols = st.columns(4)
+    # グループ毎にメトリクスを表示（最大12）
+    by_groups = []
+    for name, g in grouped.groupby(dim_label):
+        g = g.sort_values('timestamp')
+        if len(g) >= 2:
+            last = g.iloc[-1]['count']
+            prev = g.iloc[-2]['count']
+            pct = (last - prev) / prev if prev != 0 else np.nan
+            by_groups.append((name, g, pct))
+    by_groups = sorted(by_groups, key=lambda x: (x[2] if pd.notna(x[2]) else -np.inf), reverse=True)[:12]
+    for i, (name, g, _) in enumerate(by_groups):
+        with cols[i % len(cols)]:
+            show_metrics(g, label_name=str(name))
+
+# --- Data preview & export ---
+with st.expander('データ（先頭）を確認'):
+    st.dataframe(df.head(20))
+
+if st.button('集計データをCSVでダウンロード'):
+    if dim_label == '全体':
+        out = grouped.copy()
+    else:
+        out = grouped.copy().sort_values([dim_label, 'timestamp'])
+    st.download_button('CSVを保存', out.to_csv(index=False).encode('utf-8'), file_name='aggregated.csv', mime='text/csv')
+
+st.caption('定義: 増加率 = (当期件数 - 前期件数) / 前期件数。前期が0件のときは表示不可。')
